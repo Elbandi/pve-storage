@@ -300,13 +300,11 @@ sub parse_volname {
 sub filesystem_path {
     my ($class, $scfg, $volname, $snapname) = @_;
 
-    die "lvm snapshot is not implemented"if defined($snapname);
-
     my ($vtype, $name, $vmid) = $class->parse_volname($volname);
 
     my $vg = $scfg->{vgname};
 
-    my $path = "/dev/$vg/$name";
+    my $path = defined($snapname) ? "/dev/$vg/snap_${name}_$snapname": "/dev/$vg/$name";
 
     return wantarray ? ($path, $vmid, $vtype) : $path;
 }
@@ -433,9 +431,23 @@ sub free_image {
 	run_command($cmd, errmsg => "lvrename '$vg/$volname' error");
 	return $zero_out_worker;
     } else {
-	my $tmpvg = $scfg->{vgname};
-	$cmd = ['/sbin/lvremove', '-f', "$tmpvg/$volname"];
-	run_command($cmd, errmsg => "lvremove '$tmpvg/$volname' error");
+	my $lvs = PVE::Storage::LVMPlugin::lvm_list_volumes($vg);
+
+	if (my $dat = $lvs->{$scfg->{vgname}}) {
+
+	    # remove all volume snapshots first
+	    foreach my $lv (keys %$dat) {
+		next if $lv !~ m/^snap_${volname}_${PVE::JSONSchema::CONFIGID_RE}$/;
+		my $cmd = ['/sbin/lvremove', '-f', "$vg/$lv"];
+		run_command($cmd, errmsg => "lvremove snapshot '$vg/$lv' error");
+	    }
+
+	    # finally remove original (if exists)
+	    if ($dat->{$volname}) {
+		my $cmd = ['/sbin/lvremove', '-f', "$vg/$volname"];
+		run_command($cmd, errmsg => "lvremove '$vg/$volname' error");
+	    }
+	}
     }
 
     return undef;
@@ -585,25 +597,43 @@ sub volume_size_info {
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
 
-    die "lvm snapshot is not implemented";
+    my $size = $class->volume_size_info($scfg, $storeid, $volname, 5);
+    my $vg = $scfg->{vgname};
+    my $snapvol = "snap_${volname}_$snap";
+
+    my $cmd = ['/sbin/lvcreate', '-n', $snapvol, '-pr', '-L', "${size}b", '-s', "$vg/$volname"];
+    run_command($cmd, errmsg => "lvcreate snapshot '$vg/$snapvol' error");
+
 }
 
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
 
-    die "lvm snapshot rollback is not implemented";
+    my $vg = $scfg->{vgname};
+    my $snapvol = "snap_${volname}_$snap";
+
+    my $cmd = ['/sbin/lvremove', '-f', "$vg/$volname"];
+    run_command($cmd, errmsg => "lvremove '$vg/$volname' error");
+
+    $cmd = ['/sbin/lvcreate', '-kn', '-n', $volname, '-s', "$vg/$snapvol"];
+    run_command($cmd, errmsg => "lvm rollback '$vg/$snapvol' error");
 }
 
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
 
-    die "lvm snapshot delete is not implemented";
+    my $vg = $scfg->{vgname};
+    my $snapvol = "snap_${volname}_$snap";
+
+    my $cmd = ['/sbin/lvremove', '-f', "$vg/$snapvol"];
+    run_command($cmd, errmsg => "lvremove snapshot '$vg/$snapvol' error");
 }
 
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
     my $features = {
+	snapshot => { current => 1 },
 	copy => { base => 1, current => 1},
 	rename => {current => 1},
     };
